@@ -1,0 +1,200 @@
+---
+# tasks file for rest
+
+# Check if service_registry variable is defined in <environment>_ansible_vars
+- assert:
+    that:
+      - service_registry is defined
+
+# Gather Task Definition details
+- name: Find TaskDefinition Details
+  ecs_taskdefinition_facts:
+    task_definition: "complyadvantage-{{env}}"
+    region: "{{region}}"
+  register: taskdefinition_facts
+  ignore_errors: yes
+
+- set_fact:
+    current_docker_version: ""
+
+# find current docker image version and assign value to current_docker_version
+- set_fact:
+    current_docker_version: "{{ taskdefinition_facts.container_definitions.0.image }}"
+  ignore_errors: yes
+
+
+
+# Query for existing service details
+- name: Query cluster for service details
+  ecs_service_facts:
+    region: "{{region}}"
+    cluster: "middleoffice-cluster-{{ env }}"
+    service: "complyadvantage-{{env}}"
+    details: 'true'
+  register: service_facts
+  ignore_errors: yes
+
+# Find and store the version of Current Task Definition
+- set_fact:
+    taskdef_current: "{{ service_facts.ansible_facts.services[0].taskDefinition }}"
+  ignore_errors: yes
+
+# - debug: msg="{{ taskdef_current }}"
+
+# Find old tasks related to the service
+- name: "Find the old task for this service"
+  ecs_task_facts:
+    cluster: "middleoffice-cluster-{{ env }}"
+    region: "{{region}}"
+    family: "complyadvantage-{{env}}"
+  register: task_facts
+
+# Stop old task if exist
+- name: "Stop old task for this service"
+  ecs_task:
+    cluster: "middleoffice-cluster-{{ env }}"
+    operation: stop
+    region: "{{region}}"
+    task_definition: "complyadvantage-{{env}}"
+    task: "{{item}}"
+  with_items: "{{task_facts.ansible_facts.tasks}}"
+
+# Deregister old task definition version if docker version is changed
+- name: Ensure current revision is inactive
+  ecs_taskdefinition:
+    region: "{{region}}"
+    state: absent
+    family: "complyadvantage-{{env}}"
+    revision: "{{ taskdef_current.split(':')[-1] }}"
+  when: taskdef_current and taskdef_current.split(':') and current_docker_version != "{{service_registry}}/complyadvantage:{{complyadvantage_version}}"
+  ignore_errors: yes
+
+# Create Task Definition if docker image is changed
+- name: "Task definition for complyadvantage Service"
+  ecs_taskdefinition:
+    containers:
+    - name: "complyadvantage-{{env}}"
+      cpu: "{{complyadvantage_cpu}}"
+      essential: true
+      image: "783026654359.dkr.ecr.eu-west-1.amazonaws.com/comply-advantage-service-{{ ecr_env }}:{{complyadvantage_version}}"
+      memory: "{{complyadvantage_memory}}"
+      mountPoints:
+      - containerPath: /usr/complyadvantage/deposit/reports
+        sourceVolume: complyadvantage
+      # - containerPath: /opt/oaknorth/backend/config/logs
+      #   sourceVolume: backend-logs
+      # - containerPath: /usr/oaknorth/configuration/specific
+      #   sourceVolume: rest-data-specific
+      # - containerPath: /usr/oaknorth/configuration/spring
+      #   sourceVolume: rest-data-spring
+      portMappings:
+      - containerPort: 7880
+        hostPort: "{{ complyadvantage_port }}"
+      environment:
+        - name:   "OAKNORTH_CA_SERVICE_LOG_PATH"
+          value:  "{{oaknorth_ca_service_log_path }}"
+        - name:   "OAKNORTH_SERVICE_CA_USER_NAME"
+          value:  "{{oaknorth_service_ca_user_name }}"
+        - name:   "OAKNORTH_SERVICE_CA_PASSWORD"
+          value:  "{{oaknorth_service_ca_password }}"
+        - name:   "OAKNORTH_SERVICE_CA_PASSWORD"
+          value:  "{{oaknorth_service_ca_password }}"
+        - name:   "CA_SERVICE_TOKEN"
+          value:  "{{ca_service_token }}"
+        - name:   "AUDIT_SERVICE_URL"
+          value:  "{{ audit_service_url }}"
+        - name:   "AUDIT_SERVICE_USERNAME"
+          value:  "{{ client_audit_service_username }}"
+        - name:   "AUDIT_SERVICE_PASSWORD"
+          value:  "{{ client_audit_service_password }}"
+        - name: "CA_SEARCH_PROFILE"
+          value: "retail-individual-business-deposits"
+
+      logConfiguration:
+        logDriver: awslogs
+        options:
+           awslogs-group: "complyadvantage-prelive"
+           awslogs-region: "{{ region }}"
+           awslogs-stream-prefix: complyadvantage
+    volumes:
+    - name: complyadvantage
+      host:
+         sourcePath: /var/data/{{owner}}-complyadvantage/deposit/reports
+    # - name: backend-logs
+    #   host:
+    #     sourcePath: /var/data/{{owner}}-backend/logs
+    # - name: rest-data-specific
+    #   host:
+    #     sourcePath: /var/data/{{owner}}-rest/specific
+    # - name: rest-data-spring
+    #   host:
+    #     sourcePath: /var/data/{{owner}}-rest/spring
+    family: "complyadvantage-{{env}}"
+    state: present
+    region: "{{ region }}"
+  register: task_definition
+  # when: current_docker_version != "{{service_registry}}/rest-service:{{rest_version}}"
+
+# Find target group arn for the service
+- name: Find Target group arn
+  elb_target_group_facts:
+    names: "complyadvantage-tg"
+    region: "{{region}}"
+  register: targetgroup_facts
+
+# Find Active Task Definition details
+- name: Find TaskDefinition Details
+  ecs_taskdefinition_facts:
+    task_definition: "complyadvantage-{{env}}"
+    region: "{{region}}"
+  register: active_taskdefinition
+  ignore_errors: yes
+
+- debug: msg="{{ targetgroup_facts.target_groups.0.target_group_arn }}"
+
+##Create ECS Service
+- name: "Create Service for complyadvantage Service"
+  ecs_service:
+    state: present
+    name: "complyadvantage-{{env}}"
+    cluster: "middleoffice-cluster-{{ env }}"
+    task_definition: "{{active_taskdefinition.family}}:{{active_taskdefinition.revision}}"
+    region: "{{ region }}"
+    desired_count: "{{complyadvantage_desirable_count}}"
+    load_balancers:
+      - targetGroupArn: "{{ targetgroup_facts.target_groups.0.target_group_arn }}"
+        containerName: "complyadvantage-{{env}}"
+        containerPort: 7880
+    role: "{{ service_elb_role }}-{{env}}"
+
+- pause:
+     seconds: 20
+
+- name: Find new TaskDefinition Details
+  ecs_taskdefinition_facts:
+    task_definition: "complyadvantage-{{env}}"
+    region: "{{region}}"
+  register: taskdefinition_facts_new
+  ignore_errors: yes
+
+# find current docker image version and assign value to current_docker_version
+- set_fact:
+    new_image_version: "{{ taskdefinition_facts_new.container_definitions.0.image }}"
+  ignore_errors: yes
+
+
+- name: Printing deployed image version 
+  debug:
+    msg: "image version is  {{ new_image_version}}"
+
+
+- name: Checking  if servcie is in steady state in ECS  cluster cluster
+  ecs_service_facts:
+    region: "{{region}}"
+    cluster: "middleoffice-cluster-{{ env }}"
+    service: "complyadvantage-{{env}}"
+    details: 'true'
+  register: new_service_facts
+  retries: 10
+  delay: 30
+  until: "'steady' in new_service_facts.services.0.events.0.message"
