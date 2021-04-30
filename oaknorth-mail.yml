@@ -1,0 +1,8 @@
+- hosts: localhost
+  connection: local
+  vars_files:
+    - group_vars/tag_Environment_DEV
+
+  roles:
+    - comply-advantage
+
