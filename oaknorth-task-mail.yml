@@ -1,0 +1,143 @@
+- assert:
+    that:
+      - service_registry is defined
+      - vpc_env is defined
+      - vpc_name is defined
+
+- name: load ec2 vpc facts
+  local_action:
+    module: vpc_facts
+    region: "{{vpc_region}}"
+
+- name: find vpc id
+  set_fact:
+    vpc_id: "{{item.id}}"
+  when: item.tags.Name is defined and item.tags.Name == [vpc_name,vpc_env] | join("")
+  with_items: "{{ec2.vpcs}}"
+
+- name: find vpc subnets to use
+  set_fact:
+    private_elb_vpc_subnet_a: "{{item.id}}"
+  when: item.tags.Name is defined and item.tags.Name == [vpc_name,vpc_env,"-","APP","-","ELB","-","A"] | join("")
+  with_items: "{{ec2.subnets}}"
+
+- name: find vpc subnets to use
+  set_fact:
+    private_elb_vpc_subnet_b: "{{item.id}}"
+  when: item.tags.Name is defined and item.tags.Name == [vpc_name,vpc_env,"-","APP","-","ELB","-","B"] | join("")
+  with_items: "{{ec2.subnets}}"
+
+- name: find vpc subnets to use
+  set_fact:
+    private_elb_vpc_subnet_c: "{{item.id}}"
+  when: item.tags.Name is defined and item.tags.Name == [vpc_name,vpc_env,"-","APP","-","ELB","-","C"] | join("")
+  with_items: "{{ec2.subnets}}"
+
+- name: load rds facts
+  local_action:
+    module: rds_facts
+    region: "{{vpc_region}}"
+  ignore_errors: yes
+
+
+- name: Query cluster for service details
+  ecs_service_facts:
+    region: "{{vpc_region}}"
+    cluster: "{{ ecs_backoffice_cluster_name }}"
+    service: "configmanagement-service"
+    details: 'true'
+  register: service_facts
+  ignore_errors: yes
+
+- set_fact:
+    taskdef_current: "{{ service_facts.ansible_facts.services[0].taskDefinition }}"
+  ignore_errors: yes
+
+- debug: msg="{{ taskdef_current }}"
+  ignore_errors: yes
+
+- name: "Find the old task for this service"
+  ecs_task_facts:
+    cluster: "{{ ecs_backoffice_cluster_name }}"
+    region: "{{vpc_region}}"
+    family: "configmanagement-taskdefination"
+  register: task_facts
+
+- name: "Stop old task for this service"
+  ecs_task:
+    cluster: "{{ ecs_backoffice_cluster_name }}"
+    operation: stop
+    region: "{{vpc_region}}"
+    task_definition: "configmanagement-taskdefination"
+    task: "{{item}}"
+  with_items: "{{task_facts.ansible_facts.tasks}}"
+
+- name: Ensure current revision is inactive
+  ecs_taskdefinition:
+    region: "{{vpc_region}}"
+    state: absent
+    family: "configmanagement-taskdefination"
+    revision: "{{ taskdef_current.split(':')[-1] }}"
+  when: taskdef_current and taskdef_current.split(':')
+  ignore_errors: yes
+
+
+- name: "Task definition for configmanagement Service"
+  ecs_taskdefinition:
+    containers:
+    - name: "configmanagement"
+      cpu: "{{configmanagement_cpu}}"
+      essential: true
+      image: "{{service_registry}}/oaknorth-config-management-{{ ecr_env }}:{{configmanagement_version}}"
+      memory: "{{configmanagement_memory}}"
+      portMappings:
+      - containerPort: 8888
+        hostPort: "{{configmanagement_port}}"
+      environment:
+        - name:  "DATABASE_HOST_URL"
+          value: "{{ config_management_db_host }}"
+        - name:  "DATABASE_SCHEMA_NAME"
+          value: "{{ backend_database_schema_name }}"
+        - name:   "Backend_DB_USERNAME"
+          value:  "{{ oaknorth_backend_db_username }}"
+        - name:   "Backend_DB_PASSWORD"
+          value:  "{{ oaknorth_backend_db_password }}"
+        # - name:  "config-url"
+        #   value:  "{{ config_url }}"
+
+
+      
+      logConfiguration:
+          logDriver: awslogs
+          options:
+            awslogs-group: "configmanagement-{{ env }}"
+            awslogs-region: "{{ region }}"
+            awslogs-stream-prefix: configmanagement       
+    
+    family: "configmanagement-taskdefination"
+    state: present
+    region: "{{ vpc_region }}"
+  register: configmanagement
+
+- name: Find Target group arn
+  elb_target_group_facts:
+    names: "configmanagement-tg"
+    region: "{{ vpc_region }}"
+  register: configmanagement_tg
+
+- debug: msg="{{ configmanagement_tg.target_groups.0.target_group_arn }}"
+
+
+- name: "Create Service for configmanagement Service"
+  ecs_service:
+    state: present
+    name: configmanagement-service
+    cluster: "{{ ecs_backoffice_cluster_name }}"
+    task_definition: "{{configmanagement.taskdefinition.family}}:{{configmanagement.taskdefinition.revision}}"
+    region: "{{ vpc_region }}"
+    desired_count: "{{configmanagement_desirable_count}}"
+    load_balancers:
+      - targetGroupArn: "{{ configmanagement_tg.target_groups.0.target_group_arn }}"
+        containerName: "configmanagement"
+        containerPort: 8888
+    role: "{{ service_elb_role }}"
