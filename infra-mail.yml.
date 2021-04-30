@@ -1,0 +1,29 @@
+- hosts: tag_Environment_{{ env }}:&tag_Owner_{{ owner }}:&tag_Type_middleoffice
+  user: ec2-user
+  sudo: yes
+  vars_files:
+    - ../group_vars/{{ env }}_ansible_var
+    - ../group_vars/{{ env }}_secrets
+
+  tasks:
+    - group_by: key=Middleoffice
+      tags: always
+
+# - hosts: tag_Environment_{{ env }}:&BackOffice
+#   user: ec2-user
+#   sudo: yes
+#   vars_files:
+#     - ../group_vars/{{ env }}_ansible_var
+#     - ../group_vars/{{ env }}_secrets
+
+#   roles:
+#     - backend-data
+
+- hosts: localhost
+  connection: local
+  vars_files:
+    - ../group_vars/{{ env }}_ansible_var
+    - ../group_vars/{{ env }}_secrets
+
+  roles:
+    - comply-advantage
